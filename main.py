@@ -9,7 +9,9 @@ Popup Browser — всплывающее окно-браузер на движк
   • Блокировка/разблокировка через трей (ПКМ по значку в трее)
   • Адресная строка и кнопки управления появляются только при наведении мыши
   • Постоянный кеш HTTP / cookie / localStorage между запусками
-  • Экономия ОЗУ: GPU-композитинг выключен, 1 renderer-процесс, кеш ограничен
+  • Аппаратное ускорение GPU — плавный скролл, анимации и видео без лагов
+    (режим максимальной экономии ОЗУ без GPU: запуск с PB_NO_GPU=1)
+  • Экономия ОЗУ: 1 renderer-процесс, кеш ограничен
   • ✂ «Вырезать элемент» — клик по любому блоку страницы скрывает его,
     правило сохраняется для сайта и автоматически применяется при загрузке
   • ↩ «Вернуть вырезанное» — любой скрытый ✂-элемент можно вернуть:
@@ -43,12 +45,14 @@ DATA_DIR = APP_DIR / "data"
 RULES_FILE = DATA_DIR / "hidden_rules.json"
 STATE_FILE = DATA_DIR / "state.json"
 
-# ────────────────── Настройки Chromium для экономии памяти ───────────────────
-# Память: без GPU-композитинга, один renderer-процесс, без фоновых сервисов.
-# Если нужно плавное видео — удалите "--disable-gpu ".
+# ────────────────── Настройки Chromium: скорость и память ────────────────────
+# Аппаратное ускорение GPU включено по умолчанию: скролл, анимации и видео
+# рендерятся видеокартой, без лагов. Память экономят: один renderer-процесс,
+# без фоновых сервисов, кеш ограничен.
+# Режим максимальной экономии ОЗУ (без GPU): запустите с PB_NO_GPU=1
+#   (Windows:  set PB_NO_GPU=1 , затем run_windows.bat)
+# или добавьте "--disable-gpu " в начало строки ниже.
 CHROMIUM_FLAGS = (
-    "--disable-gpu "
-    "--disable-software-rasterizer "
     "--disable-dev-tools "
     "--disable-features=Translate,BackForwardCache,MediaRouter,OptimizationHints "
     "--disable-back-forward-cache "
@@ -57,6 +61,8 @@ CHROMIUM_FLAGS = (
     "--process-per-site "
     "--autoplay-policy=no-user-gesture-required"
 )
+if os.environ.get("PB_NO_GPU"):
+    CHROMIUM_FLAGS = "--disable-gpu --disable-software-rasterizer " + CHROMIUM_FLAGS
 # Ещё меньше памяти (−40…60 МБ, чуть менее стабильно): добавьте в строку выше
 # флаг "--single-process".
 
@@ -976,6 +982,8 @@ def _autotest(win, out_path):
 
 def main():
     DATA_DIR.mkdir(exist_ok=True)
+    # Общие GL-контексты — корректная работа WebEngine с аппаратным ускорением
+    QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
     app.setApplicationName("Popup Browser")
     app.setQuitOnLastWindowClosed(False)
