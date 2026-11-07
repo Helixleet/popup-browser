@@ -12,10 +12,14 @@ Popup Browser — всплывающее окно-браузер на движк
   • Экономия ОЗУ: GPU-композитинг выключен, 1 renderer-процесс, кеш ограничен
   • ✂ «Вырезать элемент» — клик по любому блоку страницы скрывает его,
     правило сохраняется для сайта и автоматически применяется при загрузке
+  • ↩ «Вернуть вырезанное» — любой скрытый ✂-элемент можно вернуть:
+    подменю в ПКМ по странице, в меню трея и кнопка ↩ на панели
   • </> «Редактировать HTML» — правка исходного кода страницы вручную
 
 Управление:
-  Наведите мышь на окно    — панель: адрес, ↻ обновить, ✂ вырезать, </> HTML, 🔒 блок
+  Наведите мышь на окно    — панель: адрес, ↻ обновить, ✂ вырезать,
+                             ↩ вернуть, </> HTML, 🔒 блок
+  ПКМ по странице          — меню (обновить, ✂ вырезать, ↩ вернуть вырезанное…)
   ПКМ по значку в трее     — меню (разблокировать, обновить, скрыть, кеш, выход)
   ЛКМ по значку в трее     — показать / скрыть окно
   ⠿ на панели или Ctrl+ЛКМ — перетащить окно
@@ -110,7 +114,7 @@ PICKER_JS = r"""
     e.stopPropagation();
     var el = e.target;
     if (!el || el === state.box) return;
-    el.style.setProperty('display', 'none', 'important');
+    window.__pbHide(el);
     state.picks.push(cssPath(el));
   }
   function onKey(e) {
@@ -133,6 +137,23 @@ PICKER_JS = r"""
     }
     return parts.join(' > ');
   }
+  // Скрытие с пометкой data-pb-hidden: позволяет потом вернуть элемент (↩),
+  // восстановив прежнее значение inline-display, если оно было.
+  window.__pbHide = function (el) {
+    if (!el || el.getAttribute('data-pb-hidden')) return;
+    el.setAttribute('data-pb-hidden', '1');
+    var prev = el.style.getPropertyValue('display');
+    if (prev) el.setAttribute('data-pb-prev', prev);
+    el.style.setProperty('display', 'none', 'important');
+  };
+  window.__pbUnhide = function (el) {
+    if (!el || !el.getAttribute('data-pb-hidden')) return;
+    var prev = el.getAttribute('data-pb-prev');
+    if (prev) el.style.setProperty('display', prev);
+    else el.style.removeProperty('display');
+    el.removeAttribute('data-pb-hidden');
+    el.removeAttribute('data-pb-prev');
+  };
   function setActive(on) {
     state.active = on;
     if (state.box) state.box.style.display = 'none';
@@ -160,17 +181,41 @@ POLL_JS = (
 )
 
 
-def apply_rules_js(rules):
-    """JS: скрыть все элементы по сохранённым CSS-селекторам."""
+# Хелперы скрытия/возврата для runJavaScript-сниппетов: если PICKER_JS уже
+# внедрён — используются его window.__pbHide/__pbUnhide, иначе локальные копии.
+_RULE_HELPERS = (
+    "var H=window.__pbHide||function(el){"
+    "if(!el||el.getAttribute('data-pb-hidden'))return;"
+    "el.setAttribute('data-pb-hidden','1');"
+    "var p=el.style.getPropertyValue('display');"
+    "if(p)el.setAttribute('data-pb-prev',p);"
+    "el.style.setProperty('display','none','important');};"
+    "var U=window.__pbUnhide||function(el){"
+    "if(!el||!el.getAttribute('data-pb-hidden'))return;"
+    "var p=el.getAttribute('data-pb-prev');"
+    "if(p)el.style.setProperty('display',p);"
+    "else el.style.removeProperty('display');"
+    "el.removeAttribute('data-pb-hidden');"
+    "el.removeAttribute('data-pb-prev');};"
+)
+
+
+def set_rules_js(old_rules, new_rules):
+    """JS: вернуть элементы по old_rules и скрыть по new_rules (итог)."""
     return (
-        "(function(){var rules=" + json.dumps(rules) + ";"
-        "function hide(){rules.forEach(function(s){try{"
-        "document.querySelectorAll(s).forEach(function(el){"
-        "el.style.setProperty('display','none','important');});}catch(e){}});}"
-        "if(document.readyState==='loading')"
-        "{document.addEventListener('DOMContentLoaded',hide);}else{hide();}"
+        "(function(){" + _RULE_HELPERS +
+        "function each(s,fn){try{document.querySelectorAll(s).forEach(fn);}catch(e){}}"
+        "var old=" + json.dumps(list(old_rules)) + ";"
+        "var neu=" + json.dumps(list(new_rules)) + ";"
+        "old.forEach(function(s){each(s,U);});"
+        "neu.forEach(function(s){each(s,H);});"
         "})();"
     )
+
+
+def apply_rules_js(rules):
+    """JS: скрыть элементы по CSS-селекторам (с пометкой — можно вернуть ↩)."""
+    return set_rules_js([], rules)
 
 
 def _dbg(*args):
@@ -491,11 +536,14 @@ class PopupBrowser(QMainWindow):
         self.btn_pick = self._mk_btn("✂", "Режим вырезания: клик по блоку скрывает его "
                                          "(Esc — выход). Правила сохраняются для сайта.",
                                      self.toggle_picker, checkable=True)
+        self.btn_restore = self._mk_btn("↩", "Вернуть вырезанные (✂) элементы этого сайта",
+                                        self.show_restore_menu)
         self.btn_html = self._mk_btn("</>", "Редактировать HTML страницы", self.edit_html)
         self.btn_lock = self._mk_btn("🔒", "Заблокировать окно: клики проходят насквозь.\n"
                                          "Разблокировка — ПКМ по значку в трее",
                                      lambda: self.set_locked(True))
-        for b in (self.btn_reload, self.btn_pick, self.btn_html, self.btn_lock):
+        for b in (self.btn_reload, self.btn_pick, self.btn_restore,
+                  self.btn_html, self.btn_lock):
             row.addWidget(b)
 
         central = self.centralWidget()
@@ -602,13 +650,17 @@ class PopupBrowser(QMainWindow):
         self.act_unlock = self._act("🔓  Разблокировать окно", lambda: self.set_locked(False))
         self.act_reload = self._act("↻  Обновить страницу", self.reload)
         self.act_pick = self._act("", self.toggle_picker)
+        self.restore_menu = QMenu("↩  Вернуть вырезанное", self.tray_menu)
+        self.tray_menu.aboutToShow.connect(
+            lambda: self._fill_restore_menu(self.restore_menu))
         self.act_html = self._act("</>  Редактировать HTML страницы…", self.edit_html)
         self.act_show = self._act("👁  Показать / скрыть окно", self.toggle_visible)
         self.act_cache = self._act("🧹  Очистить кеш", self.clear_cache)
         self.act_quit = self._act("🚪  Выход (освободить память)", self.quit_app)
 
         for a in (self.act_lock, self.act_unlock, self.act_reload, self.act_pick,
-                  self.act_html, self.act_show, self.act_cache, self.act_quit):
+                  self.restore_menu.menuAction(), self.act_html, self.act_show,
+                  self.act_cache, self.act_quit):
             self.tray_menu.addAction(a)
         self.tray_menu.insertSeparator(self.act_show)
 
@@ -726,6 +778,73 @@ class PopupBrowser(QMainWindow):
         save_json(RULES_FILE, self.rules)
         return True
 
+    def remove_rule(self, host, selector):
+        """↩ Убрать правило ✂ — вырезанные элементы снова показываются."""
+        host = host or "file"
+        lst = self.rules.get(host) or []
+        if selector not in lst:
+            return False
+        lst.remove(selector)
+        if lst:
+            self.rules[host] = lst
+        else:
+            self.rules.pop(host, None)
+        save_json(RULES_FILE, self.rules)
+        self.page.runJavaScript(set_rules_js([selector], lst))
+        _dbg("remove_rule", host, selector)
+        return True
+
+    def restore_all_rules(self, host=None):
+        """↩ Вернуть все вырезанные элементы сайта. Возвращает число правил."""
+        host = host or self._current_host()
+        old = self.rules.pop(host, None) or []
+        if not old:
+            return 0
+        save_json(RULES_FILE, self.rules)
+        self.page.runJavaScript(set_rules_js(old, []))
+        _dbg("restore_all_rules", host, len(old))
+        return len(old)
+
+    def _current_host(self):
+        return self.page.url().host() or "file"
+
+    def _fill_restore_menu(self, menu):
+        """Заполнить меню «↩ Вернуть вырезанное» правилами текущего сайта."""
+        menu.clear()
+        rules = list(self.rules.get(self._current_host()) or [])
+        if not rules:
+            a = menu.addAction("На этом сайте ничего не вырезано")
+            a.setEnabled(False)
+            return
+        head = menu.addAction("Вырезано на этом сайте: %d" % len(rules))
+        head.setEnabled(False)
+        for sel in rules:
+            act = menu.addAction("↩  " + (sel if len(sel) <= 70 else sel[:67] + "…"))
+            act.setToolTip(sel)
+            act.triggered.connect(lambda *_, s=sel: self._restore_one(s))
+        menu.addSeparator()
+        menu.addAction("↩  Вернуть всё (%d)" % len(rules), self._restore_all)
+
+    def _restore_one(self, sel):
+        if self.remove_rule(self._current_host(), sel):
+            self.tray.showMessage("↩ Элемент возвращён", sel[:100],
+                                  QSystemTrayIcon.Information, 1200)
+
+    def _restore_all(self):
+        n = self.restore_all_rules()
+        if n:
+            self.tray.showMessage("↩ Элементы возвращены",
+                                  "сброшено правил сайта: %d" % n,
+                                  QSystemTrayIcon.Information, 1500)
+
+    def show_restore_menu(self):
+        """Кнопка ↩ на панели — список вырезанного раскрывается под кнопкой."""
+        if self._locked:
+            return
+        m = QMenu(self)
+        self._fill_restore_menu(m)
+        m.exec(self.btn_restore.mapToGlobal(self.btn_restore.rect().bottomLeft()))
+
     def apply_saved_rules(self):
         host = self.page.url().host() or "file"
         rules = self.rules.get(host) or []
@@ -785,6 +904,8 @@ class PopupBrowser(QMainWindow):
             m.addAction("→  Вперёд", lambda: self.page.triggerAction(QWebEnginePage.Forward))
         m.addSeparator()
         m.addAction("✂  Вырезать элемент (клик по блоку, Esc — выход)", self.toggle_picker)
+        rm = m.addMenu("↩  Вернуть вырезанное")
+        self._fill_restore_menu(rm)
         m.addAction("</>  Редактировать HTML страницы…", self.edit_html)
         m.addSeparator()
         if self.page.selectedText():
@@ -831,6 +952,15 @@ def _autotest(win, out_path):
             win.set_locked(True)
             res["locked"] = win._locked
             win.set_locked(False)
+            host = win.page.url().host() or "file"
+            res["rule_removed"] = bool(win.remove_rule(host, "#a"))
+            win.page.runJavaScript(
+                "getComputedStyle(document.querySelector('#a')).display", got2)
+
+        def got2(r):
+            # после ↩ элемент снова видим (display != none)
+            res["restored_display"] = str(r)
+            res["restored"] = str(r) != "none"
             save_json(out_path, res)
             QApplication.instance().quit()
 
