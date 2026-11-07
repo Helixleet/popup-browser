@@ -1,0 +1,147 @@
+name: Build & Release (Windows)
+
+# Залили код → Actions сам собирает exe под Windows и публикует его в Releases.
+# Никаких артефактов Actions — готовый zip сразу в релизе.
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Версия релиза, например v1.0.1 (пусто = автоматически)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PySide6 pyinstaller
+
+      - name: Build exe (PyInstaller, onedir, windowed)
+        run: pyinstaller --noconfirm --clean --onedir --windowed --name PopupBrowser main.py
+
+      - name: Determine version
+        id: ver
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          V=""
+          if [ -n "$INPUT_VERSION" ]; then
+            V="$INPUT_VERSION"
+          elif [[ "$REF_NAME" == v* ]]; then
+            V="$REF_NAME"
+          else
+            V="v0.0.$GITHUB_RUN_NUMBER"
+          fi
+          # только безопасные символы
+          V=$(echo "$V" | tr -cd 'A-Za-z0-9._-')
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Версия релиза: $V"
+
+      - name: Strip unused Qt modules (экономия размера)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "SilentlyContinue"
+          $p = "dist\PopupBrowser\_internal\PySide6"
+          # 1) DLL удалённых модулей Qt (в Qt/lib и в корне PySide6 — где найдём)
+          $dllRoots = @("$p\Qt\lib", "$p")
+          $dllPatterns = @(
+            "Qt6Quick3D*","Qt6Charts*","Qt6Graphs*","Qt6DataVisualization*","Qt6Multimedia*",
+            "Qt6Pdf*","Qt6Designer*","Qt6Help*","Qt6Test*","Qt6Sql*","Qt6SerialPort*",
+            "Qt6Sensors*","Qt6Scxml*","Qt6StateMachine*","Qt6RemoteObjects*","Qt6SpatialAudio*",
+            "Qt6TextToSpeech*","Qt6VirtualKeyboard*","Qt6WebSockets*","Qt6NetworkAuth*",
+            "Qt6Bluetooth*","Qt6Nfc*","Qt6SerialBus*","Qt6Location*","Qt6Labs*",
+            "Qt6QuickDialogs2*","Qt6QuickTimeline*","Qt6QuickParticles*","Qt6QuickShapes*",
+            "Qt6QuickEffects*","Qt6QuickVectorImageGenerator*",
+            "Qt6QuickControls2Fusion*","Qt6QuickControls2Imagine*","Qt6QuickControls2FluentWinUI3*",
+            "Qt6QuickControls2Material*","Qt6QuickControls2Universal*","Qt6QuickControls2Native*"
+          )
+          foreach ($d in $dllRoots) {
+            foreach ($pat in $dllPatterns) {
+              Remove-Item -Path (Join-Path $d ($pat + ".dll")) -Force
+            }
+          }
+          # 2) Python-обёртки удалённых модулей (*.pyd в корне PySide6)
+          $pydPatterns = @(
+            "QtQuick3D*","QtCharts*","QtGraphs*","QtDataVisualization*","QtMultimedia*",
+            "QtMultimediaWidgets*","QtPdf*","QtDesigner*","QtHelp*","QtTest*","QtSql*",
+            "QtSerialPort*","QtSensors*","QtScxml*","QtStateMachine*","QtRemoteObjects*",
+            "QtSpatialAudio*","QtTextToSpeech*","QtWebSockets*","QtNetworkAuth*","QtBluetooth*",
+            "QtNfc*","QtSerialBus*","QtLocation*","Qt3D*","QtXml*","QtConcurrent*",
+            "QtQuickTest*","QtSvgWidgets*","QtWaylandClient*"
+          )
+          foreach ($pat in $pydPatterns) {
+            Remove-Item -Path "$p\$pat.pyd" -Force
+          }
+          # 3) QML-модули удалённых библиотек
+          $qmlDirs = @("QtQuick3D","QtCharts","QtGraphs","QtMultimedia","QtPdf","QtSensors",
+            "QtTest","Qt3D","QtDataVisualization","QtLocation","QtPurchasing","QtWebSockets",
+            "QtTextToSpeech","QtVirtualKeyboard","QtRemoteObjects","QtScxml","QtStateMachine",
+            "QtSpatialAudio","labs","Qt5Compat","QtWayland")
+          foreach ($d in $qmlDirs) {
+            Remove-Item -Path "$p\Qt\qml\$d" -Recurse -Force
+          }
+          $qmlSub = @("Dialogs","Pdf","Scene3D","Scene2D","Effects","Particles","Shapes",
+            "Timeline","VirtualKeyboard","VectorImage")
+          foreach ($d in $qmlSub) {
+            Remove-Item -Path "$p\Qt\qml\QtQuick\$d" -Recurse -Force
+          }
+          # 4) Локали Chromium: оставляем только en-US и ru
+          $loc = "$p\Qt\translations\qtwebengine_locales"
+          if (Test-Path $loc) {
+            Get-ChildItem $loc -File |
+              Where-Object { $_.Name -notin @("en-US.pak","ru.pak") } |
+              Remove-Item -Force
+          }
+          # 5) DevTools-ресурсы (в приложении devtools выключены флагом)
+          Remove-Item -Path "$p\Qt\resources\qtwebengine_devtools_resources.pak" -Force
+          Write-Host "Стрижка завершена."
+          "Размер билда:"
+          "{0:N0} МБ" -f ((Get-ChildItem dist\PopupBrowser -Recurse |
+            Measure-Object Length -Sum).Sum / 1MB)
+
+      - name: Pack portable zip
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist\PopupBrowser\PopupBrowser.exe")) {
+            throw "PopupBrowser.exe не найден — сборка не удалась"
+          }
+          Compress-Archive -Path "dist\PopupBrowser" `
+            -DestinationPath "PopupBrowser-${{ steps.ver.outputs.version }}-win64.zip" -Force
+
+      - name: Publish to GitHub Releases (сразу в релиз, без артефактов)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.version }}
+          name: PopupBrowser ${{ steps.ver.outputs.version }} (Windows)
+          body: |
+            Портативная сборка для Windows (движок Chromium).
+
+            **Установка:** распакуйте zip и запустите `PopupBrowser.exe`.
+            Python и дополнительные зависимости не нужны.
+
+            Управление: ПКМ по значку в трее — меню; наведите мышь на окно —
+            адресная строка; ПКМ по странице — ✂ вырезать элемент / </> HTML-редактор.
+          generate_release_notes: true
+          files: PopupBrowser-*-win64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

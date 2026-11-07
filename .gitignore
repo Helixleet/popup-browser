@@ -1,0 +1,6 @@
+# Popup Browser — служебные папки
+__pycache__/
+data/
+build/
+dist/
+*.pyc
